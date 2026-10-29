@@ -1,0 +1,8 @@
+# Never commit credentials, tokens, state, or logs.
+.gmail-*.json
+secrets/
+*.log
+*.tmp
+/var/lib/z-push/
+state/
+.env
