@@ -1,0 +1,13 @@
+services:
+  zpush-gmail:
+    build: .
+    container_name: zpush-gmail
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:80"
+    volumes:
+      - zpush-gmail-state:/var/lib/z-push
+      - zpush-gmail-log:/var/log/z-push
+volumes:
+  zpush-gmail-state:
+  zpush-gmail-log:
