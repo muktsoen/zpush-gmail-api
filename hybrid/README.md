@@ -99,6 +99,14 @@ phone-side failure mode.
   (baselined at the first `wait()` of a Ping), not against the current
   `wait()` start, so a wake written while `CheckForChanges()` validates
   a previous notification is still seen by the next `wait()`.
+- **Wake list + constructor baseline (fixed 2026-11-01, per a second
+  upstream review)**: a wake returns the folders ever passed to
+  `addFolder()`, not the live sockets, so a folder whose IDLE
+  connection the server closed is still reported instead of the wake
+  being consumed while `wait()` returns `[]`. And the baseline is
+  taken in the constructor, not on the first `wait()`, so a wake
+  written while the folder pool is being built is not swallowed into
+  the baseline.
 - **1-second race**: a flag written just before a new Ping starts is
   missed by design (the new wait starts after the flag). It only
   matters when mail arrives exactly at a Ping handover; an idle phone
