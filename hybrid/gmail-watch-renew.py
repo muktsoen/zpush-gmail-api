@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 BASE = "/opt/gmail-watch"
@@ -39,6 +40,12 @@ def post_json(url, payload, access_token=None):
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")[:300]
         fail("HTTP %d from %s: %s" % (e.code, url, body))
+    except (urllib.error.URLError, OSError) as e:
+        # Network failure (DNS, timeout, refused): fail cleanly with a
+        # WATCH_FAIL line instead of an uncaught traceback. The cron
+        # retries daily and the 48h window gives two attempts; expiry
+        # only falls back to IDLE, it never drops mail.
+        fail("network from %s: %s" % (url, type(e).__name__))
 
 
 def main():
