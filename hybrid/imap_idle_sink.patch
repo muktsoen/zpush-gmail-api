@@ -1,0 +1,141 @@
+--- a/backend/imap/imap_idle_sink.php
++++ b/backend/imap/imap_idle_sink.php
+@@ -176,64 +176,100 @@
+         return true;
+     }
+ 
++    // Hybrid push: Gmail Pub/Sub notifications land in this file (bind
++    // mount from the host receiver). The file holds the last fresh wake
++    // timestamp; it is never consumed, so a wake seen by one wait() call
++    // cannot re-trigger the next Ping: the next call starts after the
++    // flag time. The receiver only writes fresh (< 5 min) notifications.
++    const WAKE_FILE = '/var/lib/z-push/pubsub/wake.flag';
++    const WAKE_SLICE = 2;
++
+     /**
+      * Block up to $timeout seconds waiting for any IDLE socket to receive a
+      * server-side change notification. Returns the imapids that received one.
++     * Between IDLE slices it also checks the Pub/Sub wake flag: on a wake
++     * it returns ALL watched folders, because a Pub/Sub notification names
++     * no folder. The caller then Syncs via IMAP, which finds the real
++     * diffs; folders without changes simply report none.
+      *
+      * @param int $timeout   maximum seconds to wait (clamped >= 1)
+      * @return array         list of imapids that signalled a change
+      */
+     public function wait($timeout) {
+         $changed = array();
++        $timeout = max(1, (int)$timeout);
+         if (empty($this->sockets)) {
+-            sleep(max(1, (int)$timeout));
++            sleep($timeout);
+             return $changed;
+         }
+ 
+-        $read = array();
+-        $byId = array();
+-        foreach ($this->sockets as $imapid => $entry) {
+-            $read[] = $entry['sock'];
+-            $byId[(int)$entry['sock']] = $imapid;
+-        }
+-        $write = null;
+-        $except = null;
+-
+-        $ready = @stream_select($read, $write, $except, max(1, (int)$timeout), 0);
+-        if ($ready === false || $ready === 0) {
+-            return $changed; // timeout or interrupted
+-        }
++        $waitStart = time();
++        $deadline = $waitStart + $timeout;
++        while (time() < $deadline) {
++            $slice = min(self::WAKE_SLICE, $deadline - time());
++            if ($slice < 1) {
++                $slice = 1;
++            }
+ 
+-        foreach ($read as $sock) {
+-            $imapid = isset($byId[(int)$sock]) ? $byId[(int)$sock] : null;
+-            if ($imapid === null) {
+-                continue;
++            $read = array();
++            $byId = array();
++            foreach ($this->sockets as $imapid => $entry) {
++                $read[] = $entry['sock'];
++                $byId[(int)$entry['sock']] = $imapid;
+             }
++            $write = null;
++            $except = null;
+ 
+-            $data = '';
+-            $deadline = microtime(true) + 0.5;
+-            while (microtime(true) < $deadline) {
+-                $chunk = @fread($sock, 8192);
+-                if ($chunk === false || $chunk === '') {
+-                    break;
++            $ready = @stream_select($read, $write, $except, $slice, 0);
++            if ($ready !== false && $ready > 0) {
++                foreach ($read as $sock) {
++                    $imapid = isset($byId[(int)$sock]) ? $byId[(int)$sock] : null;
++                    if ($imapid === null) {
++                        continue;
++                    }
++
++                    $data = '';
++                    $readDeadline = microtime(true) + 0.5;
++                    while (microtime(true) < $readDeadline) {
++                        $chunk = @fread($sock, 8192);
++                        if ($chunk === false || $chunk === '') {
++                            break;
++                        }
++                        $data .= $chunk;
++                        if (strlen($chunk) < 8192) {
++                            break;
++                        }
++                    }
++
++                    if ($data === '') {
++                        // Socket readable but empty = remote closed; drop and continue
++                        $this->dropFolder($imapid);
++                        continue;
++                    }
++
++                    $this->sockets[$imapid]['lastIo'] = time();
++
++                    // Any of these untagged responses means "something changed in this folder"
++                    if (preg_match('/\*\s+\d+\s+(EXISTS|EXPUNGE|RECENT|FETCH)\b/i', $data)) {
++                        $changed[] = $imapid;
++                    }
+                 }
+-                $data .= $chunk;
+-                if (strlen($chunk) < 8192) {
+-                    break;
++                if (!empty($changed)) {
++                    return $changed;
+                 }
+             }
+ 
+-            if ($data === '') {
+-                // Socket readable but empty = remote closed; drop and continue
+-                $this->dropFolder($imapid);
+-                continue;
+-            }
+-
+-            $this->sockets[$imapid]['lastIo'] = time();
+-
+-            // Any of these untagged responses means "something changed in this folder"
+-            if (preg_match('/\*\s+\d+\s+(EXISTS|EXPUNGE|RECENT|FETCH)\b/i', $data)) {
+-                $changed[] = $imapid;
++            // Pub/Sub wake check (cheap stat, once per slice).
++            // PHP caches stat results for the whole request: without
++            // clearstatcache() a long Ping would keep seeing the flag
++            // mtime from its first slice and never notice an update.
++            clearstatcache(true, self::WAKE_FILE);
++            $wakeMtime = @filemtime(self::WAKE_FILE);
++            if ($wakeMtime !== false && $wakeMtime >= $waitStart) {
++                if (class_exists('ZLog')) {
++                    ZLog::Write(LOGLEVEL_INFO, 'ImapIdleSink: Pub/Sub wake flag seen, returning all watched folders');
++                }
++                return array_keys($this->sockets);
+             }
+         }
+ 
