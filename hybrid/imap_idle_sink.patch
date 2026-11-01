@@ -1,6 +1,31 @@
 --- a/backend/imap/imap_idle_sink.php
 +++ b/backend/imap/imap_idle_sink.php
-@@ -176,64 +176,128 @@
+@@ -71,6 +71,20 @@
+             $this->tlsMode = 'starttls';
+         }
+         $this->verifyCert = (strpos($opts, '/novalidate-cert') === false);
++
++        // Baseline the wake flag for this Ping. ChangesSink() creates
++        // the sink right after the Ping's first CountChanges(), so a
++        // baseline taken here sits after that check: any wake written
++        // later (including while the folder pool is being built, one
++        // connect/TLS/LOGIN/SELECT/IDLE after another) has a newer
++        // mtime and fires on the first wait(). Taking the baseline in
++        // wait() instead would swallow wakes written during pool build.
++        // A change that arrived before this Ping is still picked up:
++        // CheckForChanges() runs CountChanges() on the first iteration
++        // of every Ping.
++        clearstatcache(true, self::WAKE_FILE);
++        $baseline = @filemtime(self::WAKE_FILE);
++        $this->lastWakeMtime = ($baseline !== false) ? $baseline : 0;
+     }
+ 
+     public function __destruct() {
+@@ -173,67 +187,128 @@
+             'idleTag' => $tag,
+             'lastIo'  => time(),
+         );
++        $this->wakeFolders[$imapid] = true;
          return true;
      }
  
@@ -17,10 +42,17 @@
 +    const WAKE_SLICE = 2;
 +
 +    // Last wake-flag mtime this sink has acted on, across wait() calls
-+    // within one Ping (null = not yet baselined). The sink object lives
-+    // for the whole Ping; a new Ping baselines from the flag file on
-+    // its first wait() call (see wait()).
++    // within one Ping. Baselined in the constructor (see below); a new
++    // Ping gets a new sink, so every Ping baselines fresh.
 +    private $lastWakeMtime = null;
++
++    // Folders ever added via addFolder() in this Ping (imapid => true).
++    // Unlike $sockets, entries are NOT removed when dropFolder()
++    // closes a socket: a wake must still report a folder whose IDLE
++    // connection the server closed, otherwise the wake is consumed
++    // while wait() returns [] and the change waits for the forced
++    // CountChanges() or the next Ping.
++    private $wakeFolders = array();
 +
      /**
       * Block up to $timeout seconds waiting for any IDLE socket to receive a
@@ -39,7 +71,8 @@
 -            sleep(max(1, (int)$timeout));
 -            return $changed;
 -        }
--
++        $timeout = max(1, (int)$timeout);
+ 
 -        $read = array();
 -        $byId = array();
 -        foreach ($this->sockets as $imapid => $entry) {
@@ -48,43 +81,18 @@
 -        }
 -        $write = null;
 -        $except = null;
-+        $timeout = max(1, (int)$timeout);
- 
+-
 -        $ready = @stream_select($read, $write, $except, max(1, (int)$timeout), 0);
 -        if ($ready === false || $ready === 0) {
 -            return $changed; // timeout or interrupted
-+        // Baseline the wake flag for this Ping: a flag already present
-+        // when the Ping starts counts as seen, so it cannot re-fire
-+        // this Ping. (A change that arrived before the Ping is still
-+        // picked up: CheckForChanges() runs CountChanges() on the
-+        // first iteration of every Ping.)
-+        if ($this->lastWakeMtime === null) {
-+            clearstatcache(true, self::WAKE_FILE);
-+            $baseline = @filemtime(self::WAKE_FILE);
-+            $this->lastWakeMtime = ($baseline !== false) ? $baseline : 0;
-         }
- 
--        foreach ($read as $sock) {
--            $imapid = isset($byId[(int)$sock]) ? $byId[(int)$sock] : null;
--            if ($imapid === null) {
--                continue;
+-        }
 +        $deadline = time() + $timeout;
 +        while (time() < $deadline) {
 +            $slice = min(self::WAKE_SLICE, $deadline - time());
 +            if ($slice < 1) {
 +                $slice = 1;
-             }
- 
--            $data = '';
--            $deadline = microtime(true) + 0.5;
--            while (microtime(true) < $deadline) {
--                $chunk = @fread($sock, 8192);
--                if ($chunk === false || $chunk === '') {
--                    break;
--                }
--                $data .= $chunk;
--                if (strlen($chunk) < 8192) {
--                    break;
++            }
++
 +            if (empty($this->sockets)) {
 +                // All IDLE connections closed mid-Ping (Gmail does
 +                // close them). Sleep the slice and let the flag check
@@ -100,17 +108,23 @@
 +                foreach ($this->sockets as $imapid => $entry) {
 +                    $read[] = $entry['sock'];
 +                    $byId[(int)$entry['sock']] = $imapid;
-                 }
--            }
++                }
 +                $write = null;
 +                $except = null;
  
--            if ($data === '') {
--                // Socket readable but empty = remote closed; drop and continue
--                $this->dropFolder($imapid);
+-        foreach ($read as $sock) {
+-            $imapid = isset($byId[(int)$sock]) ? $byId[(int)$sock] : null;
+-            if ($imapid === null) {
 -                continue;
 +                $ready = @stream_select($read, $write, $except, $slice, 0);
-+            }
+             }
+-
+-            $data = '';
+-            $deadline = microtime(true) + 0.5;
+-            while (microtime(true) < $deadline) {
+-                $chunk = @fread($sock, 8192);
+-                if ($chunk === false || $chunk === '') {
+-                    break;
 +            if ($ready !== false && $ready > 0) {
 +                foreach ($read as $sock) {
 +                    $imapid = isset($byId[(int)$sock]) ? $byId[(int)$sock] : null;
@@ -143,12 +157,21 @@
 +                    if (preg_match('/\*\s+\d+\s+(EXISTS|EXPUNGE|RECENT|FETCH)\b/i', $data)) {
 +                        $changed[] = $imapid;
 +                    }
-+                }
+                 }
+-                $data .= $chunk;
+-                if (strlen($chunk) < 8192) {
+-                    break;
 +                if (!empty($changed)) {
 +                    return $changed;
-+                }
+                 }
              }
  
+-            if ($data === '') {
+-                // Socket readable but empty = remote closed; drop and continue
+-                $this->dropFolder($imapid);
+-                continue;
+-            }
+-
 -            $this->sockets[$imapid]['lastIo'] = time();
 -
 -            // Any of these untagged responses means "something changed in this folder"
@@ -165,7 +188,7 @@
 +                if (class_exists('ZLog')) {
 +                    ZLog::Write(LOGLEVEL_INFO, 'ImapIdleSink: Pub/Sub wake flag seen, returning all watched folders');
 +                }
-+                return array_keys($this->sockets);
++                return array_keys($this->wakeFolders);
              }
          }
  
