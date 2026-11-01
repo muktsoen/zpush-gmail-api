@@ -107,6 +107,14 @@ phone-side failure mode.
   taken in the constructor, not on the first `wait()`, so a wake
   written while the folder pool is being built is not swallowed into
   the baseline.
+- **Receiver robustness (fixed 2026-11-01)**: publishTime parsing
+  accepts a missing fraction or 1-9 fractional digits (a timestamp in
+  any other legal RFC3339 shape used to skip the wake silently while
+  still ACKing 200); auth is checked before the body is read (bad
+  length 400, over 1 MB 413); a failure fetching Google's certs
+  answers 503 so Pub/Sub retries instead of 403 dropping the push.
+  The watch-renew script also fails cleanly on network errors
+  instead of an uncaught traceback.
 - **1-second race**: a flag written just before a new Ping starts is
   missed by design (the new wait starts after the flag). It only
   matters when mail arrives exactly at a Ping handover; an idle phone
