@@ -16,8 +16,11 @@ mail handling stays on IMAP).
 import base64
 import json
 import logging
+import re
 import time
+import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -86,6 +89,29 @@ def verify_token(token):
     return payload
 
 
+def parse_publish_time(s):
+    """Parse a Pub/Sub publishTime (RFC3339) to an aware datetime.
+
+    Google usually sends fractional seconds, but RFC3339 allows them to
+    be absent, and up to nanosecond precision when present. The old code
+    only accepted exactly "%Y-%m-%dT%H:%M:%S.%fZ", so a timestamp in any
+    other legal shape raised, the wake was silently skipped, and the push
+    was still ACKed with 200 (no retry). Returns None when unparseable;
+    the caller then skips the wake with a clear log reason instead of
+    crashing the freshness check.
+    """
+    if not s:
+        return None
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z$", s.strip())
+    if not m:
+        return None
+    frac = (m.group(2) or "0")[:6].ljust(6, "0")
+    try:
+        return datetime.strptime(m.group(1) + "." + frac + "Z", "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -110,8 +136,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found\n")
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
+        # Auth first, body second: unauthenticated junk must not cost a
+        # full body read, and a bad Content-Length must not kill the
+        # handler with an uncaught exception. The connection is HTTP/1.0
+        # (close after each response), so replying without consuming the
+        # body cannot desync a keep-alive stream.
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
             log.warning(json.dumps({"verified": False, "reason": "missing bearer", "at": now_iso()}))
@@ -119,10 +148,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             verify_token(auth[7:])
+        except (urllib.error.URLError, OSError) as exc:
+            # Upstream failure fetching Google's certs: answer 503 so
+            # Pub/Sub retries, instead of 403 which drops the push.
+            log.warning(json.dumps({"verified": False, "reason": "certs unavailable: " + type(exc).__name__, "at": now_iso()}))
+            self._send(503, "unavailable\n")
+            return
         except Exception as exc:
             log.warning(json.dumps({"verified": False, "reason": type(exc).__name__ + ": " + str(exc)[:80], "at": now_iso()}))
             self._send(403, "forbidden\n")
             return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            log.warning(json.dumps({"verified": False, "reason": "bad content-length", "at": now_iso()}))
+            self._send(400, "bad request\n")
+            return
+        if length <= 0:
+            log.warning(json.dumps({"verified": False, "reason": "empty body", "at": now_iso()}))
+            self._send(400, "bad request\n")
+            return
+        if length > 1024 * 1024:
+            log.warning(json.dumps({"verified": False, "reason": "body too large", "at": now_iso()}))
+            self._send(413, "too large\n")
+            return
+        raw = self.rfile.read(length)
         try:
             body = json.loads(raw.decode("utf-8"))
             msg = body["message"]
@@ -142,15 +192,15 @@ class Handler(BaseHTTPRequestHandler):
         # Wake Z-Push only for fresh notifications. The flag is written
         # in place (same inode) because Z-Push reads it through a bind
         # mount; a rename would leave the container seeing the old file.
-        try:
-            from datetime import datetime, timezone
-
-            pub = datetime.strptime(msg.get("publishTime", ""), "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-            if time.time() - pub.timestamp() <= WAKE_FRESH_SECONDS:
+        pub = parse_publish_time(msg.get("publishTime", ""))
+        if pub is None:
+            log.warning(json.dumps({"verified": True, "reason": "unparseable publishTime, wake skipped", "at": now_iso()}))
+        elif time.time() - pub.timestamp() <= WAKE_FRESH_SECONDS:
+            try:
                 with open(WAKE_PATH, "w") as f:
                     f.write(now_iso() + " historyId=" + str(data.get("historyId")) + "\n")
-        except Exception as exc:
-            log.warning(json.dumps({"wake_write_failed": type(exc).__name__, "at": now_iso()}))
+            except Exception as exc:
+                log.warning(json.dumps({"wake_write_failed": type(exc).__name__, "at": now_iso()}))
         self._send(200, "ok\n")
 
 
