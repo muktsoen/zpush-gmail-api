@@ -90,6 +90,15 @@ phone-side failure mode.
 - **JWKS, not cert dicts**: Google's certs endpoint now returns
   `{"keys": [...]}` (JWKS). Parsing it as the old kid-to-certificate
   map yields an empty key set and every push fails with "unknown kid".
+- **Empty socket set + wake gap (fixed 2026-11-01, per upstream
+  review)**: if every IDLE connection closes mid-Ping, the sliced loop
+  must sleep the slice and keep checking the flag, never call
+  `stream_select()` with empty arrays (PHP 8 throws `ValueError`,
+  an `Error` no `catch (Exception)` stops, and the Ping dies). And
+  the flag is compared against the last mtime this sink acted on
+  (baselined at the first `wait()` of a Ping), not against the current
+  `wait()` start, so a wake written while `CheckForChanges()` validates
+  a previous notification is still seen by the next `wait()`.
 - **1-second race**: a flag written just before a new Ping starts is
   missed by design (the new wait starts after the flag). It only
   matters when mail arrives exactly at a Ping handover; an idle phone
